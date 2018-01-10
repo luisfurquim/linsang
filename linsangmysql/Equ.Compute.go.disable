@@ -1,0 +1,203 @@
+package linsangmysql
+// +build windows
+
+import (
+   "time"
+   "reflect"
+   "database/sql"
+   "github.com/luisfurquim/linsang"
+)
+
+// The object is passed by value, so changes does not affect it after execution
+// Keep things this way avoiding side effects
+func (op Equ) Compute(hnd *Handle, srcNode Node) (*linsang.Set, error) {
+   var err      error
+   var sbjInt        int64
+   var objInt        int64
+   var predInt       int64
+   var nodeInt       int64
+   var sbjType       uint8
+   var objType       uint8
+   var nodeType      uint8
+   var key_hash      int64
+   var sp_hash       int64
+   var op_hash       int64
+   var res           MySQLSet
+   var subject_id    int64
+   var predicate_id  int64
+   var object_id     int64
+   var label_id      int64
+   var subject_type  uint8
+   var object_type   uint8
+   var label_type    uint8
+   var arctype       bool
+   var rows         *sql.Rows
+   var node          interface{}
+
+   // Default arc direction is Out
+   if op.Direction == 0 {
+      op.Direction = linsang.Out
+   }
+
+   res.Curr   = -1
+   res.Vertex = make([]interface{},0,16)
+
+/*
+      int64((hash64shift(uint64(sbjInt)) ^ hash64shift(uint64(predInt)) ^ hash64shift(uint64(sbjType)) ^ hash64shift(uint64(predInt<<32))) & 0x7fffffffffffffff), // sp_hash
+      int64((hash64shift(uint64(sbjInt)) ^ hash64shift(uint64(objInt))  ^ hash64shift(uint64(sbjType)) ^ hash64shift(uint64(objType))  ^ hash64shift(uint64(objInt<<32)))  & 0x7fffffffffffffff), // so_hash
+      int64((hash64shift(uint64(objInt)) ^ hash64shift(uint64(predInt)) ^ hash64shift(uint64(objType)) ^ hash64shift(uint64(predInt<<32))) & 0x7fffffffffffffff), // op_hash
+*/
+
+   if op.Predicate != "" {
+      predInt, err =  hnd.getNodeString(op.Predicate)
+      if err != nil {
+         Goose.Read.Logf(1,"Error searching object %#v node: %s", op.Value, err)
+         return nil, err
+      }
+
+      // Shortcut: if there's no such predicate return empty set
+      if predInt == 0 {
+         return &res, nil
+      }
+
+      if (srcNode.Id==0) && isRef(srcNode) {
+         srcNode.Id, nodeType, err = hnd.getNode(srcNode.Value)
+         if err != nil {
+            Goose.Read.Logf(1,"Error searching object %#v node: %s", op.Value, err)
+            return nil, err
+         }
+      } else {
+         nodeType, err = hnd.getNodeType(srcNode.Value)
+         if err != nil {
+            Goose.Read.Logf(1,"Error invalid type object %#v node: %s", op.Value, err)
+            return nil, err
+         }
+      }
+
+      key_hash = int64((hash64shift(uint64(srcNode.Id)) ^ hash64shift(uint64(predInt)) ^ hash64shift(uint64(nodeType)) ^ hash64shift(uint64(predInt<<32))) & 0x7fffffffffffffff)
+
+      if (op.Direction&1) != 0 { // In | Both | Any
+         op_hash = key_hash
+      }
+
+      if (op.Direction&2) != 0 { // Out | Both | Any
+         sp_hash = key_hash
+      }
+
+      if (op.Direction&4) != 0 { // None | Any
+         op_hash = key_hash
+         sp_hash = key_hash
+      }
+
+      Goose.Read.Logf(6,"Checking link equity")
+
+      // Fetch the link by hash composition
+      if op_hash == 0 {
+         rows, err = hnd.GetLinkSPHashQuery.Query(sp_hash)
+      } else if sp_hash == 0 {
+         rows, err = hnd.GetLinkSOHashQuery.Query(op_hash)
+      } else {
+         rows, err = hnd.GetLinkSPOPHashQuery.Query(sp_hash,op_hash)
+      }
+      if err != nil {
+         Goose.Read.Logf(6,"Error searching equal links: %s", err)
+         return 0, err
+      }
+      defer rows.Close()
+
+      Goose.Read.Logf(6,"Equals links: %#v", rows)
+
+      for rows.Next() {
+         rows.Scan(&subject_id,&predicate_id,&object_id,&label_id,&subject_type,&object_type,&label_type,&arctype)
+
+         if predId != predicate_id {
+            Goose.Read.Logf(7,"Predicate hash collision")
+            continue
+         }
+
+         found = false
+
+         if (op.Direction&linsang.In) != 0 {
+            if (op_hash!=0) && (object_id==srcNode.Id) && (object_type==nodeType) {
+               node, err = hnd.getNodeById(subject_id,subject_type)
+               if err != nil {
+                  Goose.Read.Logf(1,"Error fetching value from Input arc")
+                  return 0, err
+               }
+               res.Vertex = append(res.Vertex,node)
+               found      = true
+            }
+         }
+
+         if !found && ((op.Direction&linsang.Out)!=0) {
+            if (sp_hash!=0) && (subject_id==srcNode.Id) && (subject_type==nodeType) {
+               node, err = hnd.getNodeById(object_id,object_type)
+               if err != nil {
+                  Goose.Read.Logf(1,"Error fetching value from Input arc")
+                  return 0, err
+               }
+               res.Vertex = append(res.Vertex,node)
+               found      = true
+            }
+         }
+
+         if !found && ((op.Direction&linsang.None)!=0) {
+            if (op_hash!=0) && (object_id==srcNode.Id) && (object_type!=nodeType) {
+               node, err = hnd.getNodeById(subject_id,subject_type)
+               if err != nil {
+                  Goose.Read.Logf(1,"Error fetching value from Input arc")
+                  return 0, err
+               }
+               res.Vertex = append(res.Vertex,node)
+               found = true
+            }
+            if !found && ((sp_hash!=0) && (subject_id==srcNode.Id) && (subject_type==nodeType)) {
+               node, err = hnd.getNodeById(object_id,object_type)
+               if err != nil {
+                  Goose.Read.Logf(1,"Error fetching value from Input arc")
+                  return 0, err
+               }
+               res.Vertex = append(res.Vertex,node)
+               found = true
+            }
+         }
+
+         if found {
+            res.Len++
+         }
+
+         Goose.Read.Logf(6,"Found date node")
+      }
+
+      return res, nil
+
+   } else {
+      for set.Next() {
+         switch set.Vertex[set.Curr].(type) {
+            case bool:
+               if set.Vertex[set.Curr].(bool) {
+                  objInt = 1
+               } else {
+                  objInt = 0
+               }
+            case int64:
+               objInt = set.Vertex[set.Curr].(int64)
+            case float64:
+               objInt = hnd.GetNodeRealQuery(set.Vertex[set.Curr])
+            case time.Time:
+               objInt = hnd.GetNodeDateQuery(set.Vertex[set.Curr])
+            case string:
+               objInt = hnd.GetNodeStringHashQuery(hash64shiftString(set.Vertex[set.Curr]))
+         }
+
+         if reflect.TypeOf(op.Value) != reflect.TypeOf(set.Vertex[set.Curr]) {
+            continue
+         }
+         switch op.Value.(type) {
+            set.Vertex[set.Curr]
+         }
+
+      }
+   }
+}
+
